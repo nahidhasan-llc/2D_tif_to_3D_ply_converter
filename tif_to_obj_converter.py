@@ -3,7 +3,13 @@
 cyberware_to_obj.py
 ────────────────────────────────────────────────────────────────
 Convert a Cyberware 3030/RGB range file + paired color TIF
-into a colored OBJ file (vertex colors, no texture file needed).
+into a colored OBJ file (vertex colors).
+
+Scanner specs (Cyberware 3030 PS):
+  - Scanning volume : 18" high × 18" diameter (457.2mm × 457.2mm)
+  - Valid radius    : ≤ 9" = 228.6mm from center axis
+  - ~131,000 points
+  - Accuracy        : within 1mm
 
 Usage
 -----
@@ -23,7 +29,9 @@ import sys, math, os
 import numpy as np
 from PIL import Image
 
-INVALID_SENTINEL = 0x8000
+INVALID_SENTINEL  = 0x8000
+SCANNER_HEIGHT_MM = 18 * 25.4   # 18 inches = 457.2mm
+SCANNER_RADIUS_MM = 9  * 25.4   # 9 inches  = 228.6mm (valid scan volume radius)
 
 
 def parse_header(filepath):
@@ -57,17 +65,17 @@ def cyberware_to_obj(range_path, color_path, output_path):
     NLT    = int(params["NLT"])
     RSHIFT = int(params["RSHIFT"])
     LGINCR = int(params["LGINCR"])
-    LTINCR = int(params["LTINCR"])
 
     N_THETA    = NLG
     N_Z        = NLT
     r_scale_mm = LGINCR / 32768.0
-    z_scale_mm = LTINCR / 1000.0
+    z_scale_mm = SCANNER_HEIGHT_MM / N_Z
     theta_step = (2.0 * math.pi) / N_THETA
 
     print(f"  Angular steps : {N_THETA}  ({math.degrees(theta_step):.4f}°/step)")
     print(f"  Height steps  : {N_Z}  ({z_scale_mm:.4f} mm/step → {N_Z*z_scale_mm:.1f} mm total)")
-    print(f"  Radius scale  : (raw >> {RSHIFT}) × {r_scale_mm:.6f} mm/unit\n")
+    print(f"  Radius scale  : (raw >> {RSHIFT}) × {r_scale_mm:.6f} mm/unit")
+    print(f"  Valid radius  : ≤ {SCANNER_RADIUS_MM:.1f} mm (9\" scanner boundary)\n")
 
     # ── 2. Read range data ────────────────────────────────────────────────────
     data = (np.frombuffer(raw[header_end:header_end + NLG*NLT*2], dtype=">u2")
@@ -76,10 +84,11 @@ def cyberware_to_obj(range_path, color_path, output_path):
 
     valid_mask = (data != INVALID_SENTINEL) & (data > 0)
     radius_mm  = np.where(valid_mask, (data / (2**RSHIFT)) * r_scale_mm, np.nan)
-    valid_mask = ~np.isnan(radius_mm) & (radius_mm > 0)
+    valid_mask = ~np.isnan(radius_mm) & (radius_mm > 0) & (radius_mm <= SCANNER_RADIUS_MM)
 
     n_valid = int(valid_mask.sum())
     print(f"  Valid points  : {n_valid:,} / {N_THETA*N_Z:,}  ({100*n_valid/(N_THETA*N_Z):.1f}%)")
+    print(f"  Radius range  : {np.nanmin(radius_mm[valid_mask]):.1f} – {np.nanmax(radius_mm[valid_mask]):.1f} mm")
 
     if n_valid == 0:
         raise RuntimeError("No valid range points found.")
@@ -89,8 +98,8 @@ def cyberware_to_obj(range_path, color_path, output_path):
         np.arange(N_Z)     * z_scale_mm,
         np.arange(N_THETA) * theta_step
     )
-    X = radius_mm * np.cos(THETA)
-    Y = radius_mm * np.sin(THETA)
+    X = np.where(valid_mask, radius_mm * np.cos(THETA), np.nan)
+    Y = np.where(valid_mask, radius_mm * np.sin(THETA), np.nan)
     Z = Z_grid
 
     print(f"  X : {np.nanmin(X):.1f} – {np.nanmax(X):.1f} mm")
@@ -109,8 +118,7 @@ def cyberware_to_obj(range_path, color_path, output_path):
         (cols * cw / N_Z).astype(int).clip(0, cw-1)
     ].astype(np.uint8)
 
-    # ── 6. Write OBJ with vertex colors ──────────────────────────────────────
-    # Vertex colors in OBJ: "v x y z r g b" (r/g/b normalized 0-1)
+    # ── 6. Write OBJ with vertex colors (v x y z r g b) ─────────────────────
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w") as f:
         f.write(f"# Cyberware 3030/RGB scan\n")
@@ -147,3 +155,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+# python .\tif_to_obj_converter.py .\pat1day28A .\pat1day28A.tif

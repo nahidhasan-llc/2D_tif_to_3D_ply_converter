@@ -5,6 +5,12 @@ cyberware_to_ply.py
 Convert a Cyberware 3030/RGB range file + paired color TIF
 into a colored PLY point cloud.
 
+Scanner specs (Cyberware 3030 PS):
+  - Scanning volume : 18" high × 18" diameter (457.2mm × 457.2mm)
+  - Valid radius    : ≤ 9" = 228.6mm from center axis
+  - ~131,000 points
+  - Accuracy        : within 1mm
+
 Usage
 -----
     python cyberware_to_ply.py <range_file> <color_tif> [output.ply]
@@ -23,7 +29,9 @@ import sys, math, os
 import numpy as np
 from PIL import Image
 
-INVALID_SENTINEL = 0x8000
+INVALID_SENTINEL  = 0x8000
+SCANNER_HEIGHT_MM = 18 * 25.4   # 18 inches = 457.2mm
+SCANNER_RADIUS_MM = 9  * 25.4   # 9 inches  = 228.6mm (valid scan volume radius)
 
 
 def parse_header(filepath):
@@ -53,23 +61,23 @@ def cyberware_to_ply(range_path, color_path, output_path):
 
     # ── 1. Parse header ───────────────────────────────────────────────────────
     params, header_end, raw = parse_header(range_path)
-    NLG    = int(params["NLG"])     # rows = angular steps
+    NLG    = int(params["NLG"])     # rows = angular steps (360°)
     NLT    = int(params["NLT"])     # cols = height steps
     RSHIFT = int(params["RSHIFT"])
-    LGINCR = int(params["LGINCR"])  # radius increment: units of 1/32768 mm per raw unit
-    LTINCR = int(params["LTINCR"])  # height increment: microns per step
+    LGINCR = int(params["LGINCR"])  # radius scale factor (1/32768 mm per unit)
 
     N_THETA    = NLG
     N_Z        = NLT
-    # Correct scale factors derived from scanner geometry:
-    r_scale_mm = LGINCR / 32768.0           # mm per (raw >> RSHIFT) unit
-    z_scale_mm = LTINCR / 1000.0            # microns → mm per height step
-    theta_step = (2.0 * math.pi) / N_THETA  # radians per angular step
+    # Radius: raw >> RSHIFT, scaled by LGINCR/32768 (mm)
+    r_scale_mm = LGINCR / 32768.0
+    # Z: derived from known scanner height (18") divided by number of steps
+    z_scale_mm = SCANNER_HEIGHT_MM / N_Z
+    theta_step = (2.0 * math.pi) / N_THETA
 
     print(f"  Angular steps : {N_THETA}  ({math.degrees(theta_step):.4f}°/step)")
     print(f"  Height steps  : {N_Z}  ({z_scale_mm:.4f} mm/step → {N_Z*z_scale_mm:.1f} mm total)")
     print(f"  Radius scale  : (raw >> {RSHIFT}) × {r_scale_mm:.6f} mm/unit")
-    print(f"  LGINCR={LGINCR}, LTINCR={LTINCR}, RSHIFT={RSHIFT}\n")
+    print(f"  Valid radius  : ≤ {SCANNER_RADIUS_MM:.1f} mm (9\" scanner boundary)\n")
 
     # ── 2. Read range data ────────────────────────────────────────────────────
     data = (np.frombuffer(raw[header_end:header_end + NLG*NLT*2], dtype=">u2")
@@ -77,14 +85,14 @@ def cyberware_to_ply(range_path, color_path, output_path):
               .astype(np.float32))
 
     valid_mask = (data != INVALID_SENTINEL) & (data > 0)
+    radius_mm  = np.where(valid_mask, (data / (2**RSHIFT)) * r_scale_mm, np.nan)
 
-    # radius_mm = (raw >> RSHIFT) * LGINCR / 32768
-    radius_mm = np.where(valid_mask, (data / (2**RSHIFT)) * r_scale_mm, np.nan)
-    valid_mask = ~np.isnan(radius_mm) & (radius_mm > 0)
+    # Filter to scanner volume boundary — removes chair, stand, background noise
+    valid_mask = ~np.isnan(radius_mm) & (radius_mm > 0) & (radius_mm <= SCANNER_RADIUS_MM)
 
     n_valid = int(valid_mask.sum())
     print(f"  Valid points  : {n_valid:,} / {N_THETA*N_Z:,}  ({100*n_valid/(N_THETA*N_Z):.1f}%)")
-    print(f"  Radius range  : {np.nanmin(radius_mm):.1f} – {np.nanmax(radius_mm):.1f} mm")
+    print(f"  Radius range  : {np.nanmin(radius_mm[valid_mask]):.1f} – {np.nanmax(radius_mm[valid_mask]):.1f} mm")
 
     if n_valid == 0:
         raise RuntimeError("No valid range points found.")
@@ -95,8 +103,8 @@ def cyberware_to_ply(range_path, color_path, output_path):
         np.arange(N_Z)     * z_scale_mm,
         np.arange(N_THETA) * theta_step
     )
-    X = radius_mm * np.cos(THETA)
-    Y = radius_mm * np.sin(THETA)
+    X = np.where(valid_mask, radius_mm * np.cos(THETA), np.nan)
+    Y = np.where(valid_mask, radius_mm * np.sin(THETA), np.nan)
     Z = Z_grid
 
     print(f"  X : {np.nanmin(X):.1f} – {np.nanmax(X):.1f} mm")
@@ -166,6 +174,4 @@ if __name__ == "__main__":
 
 
 
-
-
-# python .\tif_to_ply_obj_converter.py .\pat1day28A .\pat1day28A.tif
+# python .\tif_to_ply_converter.py .\pat1day28A .\pat1day28A.tif
